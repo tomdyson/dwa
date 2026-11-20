@@ -1,0 +1,12 @@
+# App sources and exports hold client material: local only.
+apps/*
+# Except the build-your-own-apps guide, which holds none (its answers live on Cloudflare and in exports/).
+!apps/build-your-own-apps/
+apps/build-your-own-apps/app.css
+exports/
+# Worker local state and secrets
+worker/.wrangler/
+worker/.dev.vars
+node_modules/
+.DS_Store
+__pycache__/

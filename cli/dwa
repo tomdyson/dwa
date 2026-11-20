@@ -1,0 +1,565 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""dwa — disposable web apps: password-protected pages at https://with.tomd.org/<slug>/ whose
+visitors' answers are stored server-side, for Claude (or Tom) to read back.
+
+Config lives in ~/.config/dwa/.env (DWA_BASE_URL, DWA_ADMIN_TOKEN, CLOUDFLARE_API_TOKEN,
+CLOUDFLARE_ACCOUNT_ID). --local talks to `dwa dev` (wrangler dev on 127.0.0.1:8799) instead.
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import mimetypes
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+WORKER = REPO / "worker"
+CONFIG_DIR = Path.home() / ".config" / "dwa"
+CONFIG = CONFIG_DIR / ".env"
+PASSWORDS = CONFIG_DIR / "passwords.json"
+EXPORTS = REPO / "exports"
+LOCAL_BASE = "http://127.0.0.1:8799"
+WRANGLER = "wrangler@4.151.0"
+USER_AGENT = "dwa-cli/0.1 (+https://with.tomd.org)"
+DEFAULT_DAYS = 60
+IMAGE_WARN_BYTES = 1_500_000
+SKIP_FILES = {"input.css", ".DS_Store", "Thumbs.db"}
+TEXT_TYPES = ("text/", "application/json", "image/svg+xml", "application/javascript")
+EXTRA_TYPES = {".webp": "image/webp", ".svg": "image/svg+xml", ".js": "text/javascript", ".mjs": "text/javascript",
+               ".json": "application/json", ".csv": "text/csv", ".md": "text/markdown", ".woff2": "font/woff2"}
+
+# Short, common, unambiguous words (no UK/US spelling splits): easy to read out or type.
+WORDS = """amber anchor apple apricot arrow aspen autumn badger bamboo banjo barley basil beacon beaver birch
+biscuit bison blossom bramble breeze bridge brook bucket buffalo butter cabin cactus camel candle canoe canyon
+carrot castle cedar cello cherry chestnut cider cinder citrus clover cobalt comet copper coral cotton cougar
+coyote crane crater cricket crystal cypress daisy delta desert dolphin dove dragon drum eagle easel ember falcon
+fennel fern fiddle finch flame flint fossil fox garden garnet gecko ginger glacier goose granite grape gravel
+hazel heron hickory honey hornet husky iris island ivory jackal jasmine jasper juniper kayak kettle kiwi koala
+ladder lagoon lantern larch lemon lilac lily linen lizard llama lotus magnet mango maple marble meadow melon
+mint mirror moose moss nectar nutmeg oak oasis ocean olive onion orchid otter owl paddle panda panther papaya
+parrot peach pebble pecan pelican pepper piano pine plum pony poppy prairie puffin quail quartz quill rabbit
+radish raven reef ribbon river robin rocket rose ruby saddle saffron sage salmon satin shadow shell sierra
+silver sparrow spruce squid squirrel starling stone summit swan tango thistle thunder tiger timber toffee topaz
+tulip tundra turnip turtle valley velvet violet walnut walrus willow window winter wolf wombat yak zebra""".split()
+
+
+def die(msg: str, code: int = 1):
+    print(f"dwa: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def read_env(path: Path) -> dict:
+    env = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+def passphrase() -> str:
+    return "-".join(secrets.choice(WORDS) for _ in range(3)) + f"-{secrets.randbelow(90) + 10}"
+
+
+def load_passwords() -> dict:
+    return json.loads(PASSWORDS.read_text()) if PASSWORDS.exists() else {}
+
+
+def save_password(base: str, slug: str, password: str | None):
+    data = load_passwords()
+    key = f"{base}/{slug}"
+    if password is None:
+        data.pop(key, None)
+    else:
+        data[key] = password
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    PASSWORDS.write_text(json.dumps(data, indent=2) + "\n")
+    PASSWORDS.chmod(0o600)
+
+
+def when(iso: str | None) -> str:
+    if not iso:
+        return "—"
+    t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    return t.strftime("%-d %b %H:%M")
+
+
+class Client:
+    def __init__(self, local: bool):
+        if local:
+            self.base = LOCAL_BASE
+            self.token = read_env(WORKER / ".dev.vars").get("ADMIN_TOKEN") or die("worker/.dev.vars has no ADMIN_TOKEN")
+        else:
+            env = {**read_env(CONFIG), **{k: v for k, v in os.environ.items() if k.startswith("DWA_")}}
+            self.base = env.get("DWA_BASE_URL", "").rstrip("/") or die(f"DWA_BASE_URL missing from {CONFIG}")
+            self.token = env.get("DWA_ADMIN_TOKEN") or die(f"DWA_ADMIN_TOKEN missing from {CONFIG}")
+            pin_dns_if_stale(self.base)
+
+    def call(self, method: str, path: str, body=None, data: bytes | None = None, content_type: str | None = None,
+             missing_ok: bool = False):
+        headers = {"Authorization": f"Bearer {self.token}", "User-Agent": USER_AGENT}
+        if body is not None:
+            data = json.dumps(body).encode()
+            content_type = "application/json"
+        if content_type:
+            headers["Content-Type"] = content_type
+        req = urllib.request.Request(f"{self.base}/_admin{path}", data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            if missing_ok and e.code == 404:
+                return None
+            detail = e.read().decode(errors="replace")
+            try:
+                detail = json.loads(detail).get("error", detail)
+            except ValueError:
+                pass
+            die(f"{method} {path} -> {e.code}: {detail[:300]}")
+        except urllib.error.URLError as e:
+            hint = " (is `dwa dev` running?)" if self.base == LOCAL_BASE else ""
+            die(f"can't reach {self.base}: {e.reason}{hint}")
+
+    def app(self, slug: str) -> dict:
+        return self.call("GET", f"/apps/{slug}", missing_ok=True) or die(f"no app called {slug!r} (see `dwa ls`)")
+
+
+def pin_dns_if_stale(base: str):
+    """If the system resolver can't find the dwa host (a router caching NXDOMAIN from before the
+    hostname existed), look it up over DNS-over-HTTPS and pin that address for this process."""
+    import socket
+
+    host = urllib.parse.urlsplit(base).hostname
+    if not host or host in ("127.0.0.1", "localhost"):
+        return
+    try:
+        socket.getaddrinfo(host, 443)
+        return
+    except socket.gaierror:
+        pass
+    req = urllib.request.Request(f"https://cloudflare-dns.com/dns-query?name={host}&type=A",
+                                 headers={"Accept": "application/dns-json", "User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            ip = next(a["data"] for a in json.load(r).get("Answer", []) if a.get("type") == 1)
+    except Exception:
+        return
+    real = socket.getaddrinfo
+    socket.getaddrinfo = lambda h, *a, **k: real(ip if h == host else h, *a, **k)
+    print(f"dwa: local DNS can't find {host} (stale cache?); using {ip} from Cloudflare DNS", file=sys.stderr)
+
+
+def q(s: str) -> str:
+    return urllib.parse.quote(s, safe="/:")
+
+
+# --- commands ---------------------------------------------------------------------------------
+
+def cmd_new(c: Client, a):
+    if c.call("GET", f"/apps/{a.slug}", missing_ok=True):
+        die(f"{a.slug} already exists — `dwa push` to update it, `dwa password` to change its password")
+    password = a.password or passphrase()
+    expires = (dt.date.today() + dt.timedelta(days=a.days)).isoformat() + "T23:59:59Z"
+    r = c.call("PUT", f"/apps/{a.slug}", {"title": a.title, "password": password, "expires_at": expires, "open": a.open, "private": a.private})
+    save_password(c.base, a.slug, password)
+    access = "open: no password, anyone with the URL can answer" if a.open else f"password: {password}"
+    answers = "private: each visitor sees only their own" if a.private else "shared: everyone sees everyone's"
+    print(f"Created {c.base}/{a.slug}/\n  title:    {r['title']}\n  {access}\n  answers:  {answers}\n  closes:   {expires[:10]} (read-only after)")
+    share = "the URL" if a.open else "URL + password"
+    print(f"\nNext: `dwa push {a.slug} <dir>`, check it with `dwa link {a.slug}`, then share {share}.")
+
+
+def build_css(d: Path):
+    tw = shutil.which("tailwindcss") or die("tailwindcss CLI not found (brew install tailwindcss)")
+    custom = d / "input.css"
+    with tempfile.TemporaryDirectory() as tmp:
+        if custom.exists():
+            src = custom
+            if "source(none)" not in custom.read_text():
+                print("  warning: input.css lacks `source(none)`, so Tailwind will scan the whole working directory")
+        else:
+            # source(none): Tailwind v4 otherwise scans the cwd tree, not just this app.
+            src = Path(tmp) / "input.css"
+            src.write_text(f'@import "tailwindcss" source(none);\n@source "{d}";\n')
+        r = subprocess.run([tw, "-i", str(src), "-o", str(d / "app.css"), "--minify"], capture_output=True, text=True)
+        if r.returncode:
+            die(f"tailwind build failed:\n{r.stderr}")
+    print(f"  built app.css ({(d / 'app.css').stat().st_size / 1024:.1f} KB)")
+
+
+def content_type(path: Path) -> str:
+    t = EXTRA_TYPES.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return f"{t}; charset=utf-8" if t.startswith(TEXT_TYPES) else t
+
+
+def cmd_push(c: Client, a):
+    d = Path(a.dir).expanduser().resolve()
+    if not (d / "index.html").exists():
+        die(f"{d} has no index.html")
+    c.app(a.slug)
+    print(f"Pushing {d} -> {a.slug}")
+    htmls = list(d.rglob("*.html"))
+    if not a.no_css and any("app.css" in h.read_text(errors="ignore") for h in htmls):
+        build_css(d)
+
+    local = {}
+    for p in sorted(d.rglob("*")):
+        rel = p.relative_to(d).as_posix()
+        if p.is_dir() or p.name in SKIP_FILES or any(part.startswith((".", "_")) for part in rel.split("/")):
+            continue
+        local[rel] = p
+    remote = {f["path"]: f["etag"].strip('"') for f in c.call("GET", f"/apps/{a.slug}/files")}
+
+    uploaded = 0
+    for rel, p in local.items():
+        body = p.read_bytes()
+        if remote.get(rel) == hashlib.md5(body).hexdigest():
+            continue
+        c.call("PUT", f"/apps/{a.slug}/files/{q(rel)}", data=body, content_type=content_type(p))
+        uploaded += 1
+        print(f"  up   {rel} ({len(body) / 1024:.0f} KB)")
+        if p.suffix.lower() in {".png", ".jpg", ".jpeg"} and len(body) > IMAGE_WARN_BYTES:
+            print(f"       warning: {len(body) / 1e6:.1f} MB image — `dwa img {p}` makes a much smaller .webp")
+    removed = 0
+    for rel in sorted(set(remote) - set(local)):
+        c.call("DELETE", f"/apps/{a.slug}/files/{q(rel)}")
+        removed += 1
+        print(f"  del  {rel}")
+    print(f"Done: {uploaded} uploaded, {removed} removed, {len(local) - uploaded} unchanged.\n{c.base}/{a.slug}/")
+
+
+def fmt_value(v) -> str:
+    if isinstance(v, str):
+        return json.dumps(v) if "\n" not in v and len(v) <= 100 else "\n" + textwrap.indent(v, "      ")
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return "[" + ", ".join(v) + "]"
+    return json.dumps(v)
+
+
+def cmd_data(c: Client, a):
+    x = c.call("GET", f"/apps/{a.slug}/export")
+    if a.json:
+        print(json.dumps(x, indent=2))
+        return
+    i = x["info"]
+    status = "closed" if i["closed"] else f"open until {i['expires_at'][:10]}" if i.get("expires_at") else "open"
+    print(f"{i['title']} — {c.base}/{a.slug}/ ({status})")
+    private = x.get("private_state") or []
+    visits = {v["visitor"]: v for v in x.get("visits") or []}
+    if i.get("private"):
+        print(f"Private answers: {len(visits)} visitors, {i.get('visitors', 0)} with answers, {i['answers']} answers, "
+              f"last {when(i['last_at'])}, {len(x['history'])} changes in history\n")
+    else:
+        print(f"{i['answers']} answers, last {when(i['last_at'])}, {len(x['history'])} changes in history\n")
+    if x["state"] and private:
+        print("Shared answers:")
+    for r in x["state"]:
+        print(f"  {r['key']}: {fmt_value(r['value'])}\n      — {r['author']}, {when(r['at'])}")
+    groups = visitor_groups(private)
+    # Everyone who has opened the page, then anyone with answers but no recorded visit (e.g. admin writes).
+    order = list(visits) + [v for v in groups if v not in visits]
+    for v in order:
+        rows = groups.get(v, [])
+        latest = max(rows, key=lambda r: r["at"]) if rows else None
+        vi = visits.get(v)
+        name = (vi or {}).get("name") or (latest or {}).get("author") or "(no name yet)"
+        bits = [name, f"visitor {v[:8]}"]
+        if vi:
+            n = vi["visits"]
+            bits += [vi.get("device") or "?", f"{n} visit{'s' if n != 1 else ''}, first {when(vi['first_at'])}, last {when(vi['last_at'])}"]
+        bits.append(f"{len(rows)} answers" + (f", last {when(latest['at'])}" if latest else ""))
+        print("\n" + " · ".join(bits))
+        for r in rows:
+            by = f" — {r['author']}" if r["author"] != name else ""
+            print(f"  {r['key']}: {fmt_value(r['value'])}{by}")
+    if a.history:
+        print("\nHistory (oldest first):")
+        for h in x["history"]:
+            who = f"{h['author']} [{h['visitor'][:8]}]" if h.get("visitor") else h["author"]
+            print(f"  {when(h['at'])}  {who}: {h['key']} = {fmt_value(h['value'])}")
+
+
+def visitor_groups(rows: list) -> dict:
+    groups: dict = {}
+    for r in rows:
+        groups.setdefault(r["visitor"], []).append(r)
+    return groups
+
+
+def resolve_visitor(c: "Client", slug: str, prefix: str) -> str:
+    x = c.call("GET", f"/apps/{slug}/export")
+    ids = {r["visitor"] for r in x.get("private_state", [])} | {v["visitor"] for v in x.get("visits", [])}
+    hits = sorted(v for v in ids if v.startswith(prefix.lower()))
+    if not hits:
+        die(f"no visitor on {slug} starts with {prefix!r} (`dwa data {slug}` lists them)")
+    if len(hits) > 1:
+        die(f"{prefix!r} matches {len(hits)} visitors; give more of the id")
+    return hits[0]
+
+
+def cmd_ls(c: Client, a):
+    apps = c.call("GET", "/apps")
+    if not apps:
+        print("No apps.")
+        return
+    rows = [(x["slug"], (x["title"] or "")[:34], str(x["answers"]), when(x["last_at"]),
+             "closed" if x["closed"] else (x["expires_at"] or "")[:10] or "open") for x in apps]
+    head = ("APP", "TITLE", "ANSWERS", "LAST ANSWER", "CLOSES")
+    widths = [max(len(r[i]) for r in [head, *rows]) for i in range(5)]
+    for r in [head, *rows]:
+        print("  ".join(s.ljust(w) for s, w in zip(r, widths)).rstrip())
+    print(f"\n{c.base}/<app>/")
+
+
+def cmd_info(c: Client, a):
+    x = c.app(a.slug)
+    pw = load_passwords().get(f"{c.base}/{a.slug}", "(not recorded on this machine — `dwa password` sets a new one)")
+    if x.get("open"):
+        pw = f"none needed (open; `dwa password {a.slug}` puts one back)"
+    print(f"{x['title']}\n  url:      {c.base}/{a.slug}/\n  password: {pw}\n  answers:  {x['answers']} (last {when(x['last_at'])})"
+          f"\n  closes:   {'closed now' if x['closed'] else (x['expires_at'] or 'never')[:10]}")
+    if x.get("private"):
+        print(f"  private:  each visitor sees only their own answers ({x.get('visited', 0)} visitors so far, "
+              f"{x.get('visitors', 0)} with answers)")
+    files = c.call("GET", f"/apps/{a.slug}/files")
+    print(f"  files:    {len(files)} ({sum(f['size'] for f in files) / 1024:.0f} KB)")
+
+
+def cmd_password(c: Client, a):
+    c.app(a.slug)
+    password = a.password or passphrase()
+    c.call("PUT", f"/apps/{a.slug}", {"password": password, "open": False})
+    save_password(c.base, a.slug, password)
+    print(f"New password for {a.slug}: {password}\nEveryone signed in to it has been signed out, and it needs the password again.")
+
+
+def cmd_private(c: Client, a):
+    c.app(a.slug)
+    c.call("PUT", f"/apps/{a.slug}", {"private": not a.off})
+    if a.off:
+        print(f"{a.slug} is shared again: everyone sees the shared answers. Visitors' private answers are kept but hidden.")
+    else:
+        print(f"{a.slug} is private: each visitor (each browser) sees only their own answers. "
+              f"Any shared answers are kept but hidden from visitors.\n`dwa data {a.slug}` shows everyone's.")
+
+
+def cmd_open(c: Client, a):
+    c.app(a.slug)
+    c.call("PUT", f"/apps/{a.slug}", {"open": True})
+    print(f"{a.slug} is open: no password, anyone with {c.base}/{a.slug}/ can read and answer.\n"
+          f"`dwa password {a.slug}` puts a password back.")
+
+
+def cmd_close(c: Client, a):
+    c.app(a.slug)
+    c.call("PUT", f"/apps/{a.slug}", {"closed": True})
+    print(f"{a.slug} is closed: still readable with the password, answers locked. `dwa reopen` undoes it.")
+
+
+def cmd_reopen(c: Client, a):
+    c.app(a.slug)
+    expires = (dt.date.today() + dt.timedelta(days=a.days)).isoformat() + "T23:59:59Z"
+    c.call("PUT", f"/apps/{a.slug}", {"closed": False, "expires_at": expires})
+    print(f"{a.slug} is open again until {expires[:10]}.")
+
+
+def confirm(slug: str, what: str, yes: bool):
+    if yes:
+        return
+    if not sys.stdin.isatty():
+        die(f"refusing to {what} {slug} without --yes")
+    if input(f"Type the app name to {what} it: ").strip() != slug:
+        die("cancelled")
+
+
+def export_to_file(c: Client, slug: str) -> Path:
+    x = c.call("GET", f"/apps/{slug}/export")
+    EXPORTS.mkdir(exist_ok=True)
+    out = EXPORTS / f"{slug}-{dt.datetime.now():%Y%m%d-%H%M%S}.json"
+    out.write_text(json.dumps(x, indent=2) + "\n")
+    return out
+
+
+def cmd_export(c: Client, a):
+    c.app(a.slug)
+    print(export_to_file(c, a.slug))
+
+
+def cmd_reset(c: Client, a):
+    c.app(a.slug)
+    confirm(a.slug, "clear every answer in", a.yes)
+    out = export_to_file(c, a.slug)
+    c.call("DELETE", f"/apps/{a.slug}/state")
+    print(f"Cleared answers and history in {a.slug} (saved first to {out}).")
+
+
+def cmd_rm(c: Client, a):
+    c.app(a.slug)
+    confirm(a.slug, "permanently delete", a.yes)
+    out = export_to_file(c, a.slug)
+    r = c.call("DELETE", f"/apps/{a.slug}")
+    save_password(c.base, a.slug, None)
+    print(f"Deleted {a.slug} ({r['files_deleted']} files). Answers saved to {out}")
+
+
+def cmd_link(c: Client, a):
+    c.app(a.slug)
+    body = {"minutes": a.minutes}
+    if a.as_:
+        body["name"] = a.as_
+    if a.visitor:
+        body["visitor"] = resolve_visitor(c, a.slug, a.visitor)
+    r = c.call("POST", f"/apps/{a.slug}/links", body)
+    u = urllib.parse.urlsplit(r["url"])  # the Worker's own idea of its origin is wrong under `wrangler dev`
+    print(f"{c.base}{u.path}?{u.query}")
+    print(f"(one use, until {when(r['expires_at'])})", file=sys.stderr)
+
+
+def cmd_set(c: Client, a):
+    try:
+        value = json.loads(a.value)
+    except ValueError:
+        value = a.value
+    body = {"value": value, "author": a.as_}
+    if a.visitor:
+        body["visitor"] = resolve_visitor(c, a.slug, a.visitor)
+    r = c.call("PUT", f"/apps/{a.slug}/state/{q(a.key)}", body)
+    print(f"{r['key']} = {fmt_value(r['value'])} (as {r['author']})")
+
+
+def cmd_merge(c: Client, a):
+    frm = resolve_visitor(c, a.slug, a.from_)
+    into = resolve_visitor(c, a.slug, a.into)
+    r = c.call("POST", f"/apps/{a.slug}/visitors/merge", {"from": frm, "into": into})
+    print(f"Merged visitor {frm[:8]} into {r['into'][:8]}: {r['answers']} answers. Both browsers now see the same answers.")
+
+
+def cmd_img(c, a):
+    src = Path(a.src).expanduser()
+    if not src.exists():
+        die(f"{src} not found")
+    cwebp = shutil.which("cwebp") or die("cwebp not found (brew install webp)")
+    out = Path(a.out) if a.out else src.with_suffix(".webp")
+    width = None
+    r = subprocess.run(["sips", "-g", "pixelWidth", str(src)], capture_output=True, text=True)
+    if r.returncode == 0 and "pixelWidth" in r.stdout:
+        width = int(r.stdout.split("pixelWidth:")[1].split()[0])
+    cmd = [cwebp, "-quiet", "-q", str(a.quality)]
+    if width and width > a.width:
+        cmd += ["-resize", str(a.width), "0"]
+    subprocess.run([*cmd, str(src), "-o", str(out)], check=True)
+    print(f"{out} ({src.stat().st_size / 1024:.0f} KB -> {out.stat().st_size / 1024:.0f} KB"
+          f"{f', {width}px -> {a.width}px wide' if width and width > a.width else ''})")
+
+
+def wrangler_env() -> dict:
+    env = {**os.environ, **{k: v for k, v in read_env(CONFIG).items() if k.startswith("CLOUDFLARE_")}}
+    if not env.get("CLOUDFLARE_API_TOKEN"):
+        die(f"CLOUDFLARE_API_TOKEN missing from {CONFIG}")
+    return env
+
+
+def cmd_deploy(c, a):
+    sys.exit(subprocess.run(["npx", "-y", WRANGLER, "deploy"], cwd=WORKER, env=wrangler_env()).returncode)
+
+
+def cmd_dev(c, a):
+    sys.exit(subprocess.run(["npx", "-y", WRANGLER, "dev", "--port", "8799", "--ip", "127.0.0.1"], cwd=WORKER).returncode)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="dwa", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--local", action="store_true", help="target `dwa dev` on 127.0.0.1:8799 instead of production")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
+
+    def add(name, fn, help_):
+        s = sub.add_parser(name, help=help_, description=help_)
+        s.set_defaults(fn=fn)
+        return s
+
+    s = add("new", cmd_new, "create an app with a generated password")
+    s.add_argument("slug")
+    s.add_argument("--title", required=True)
+    s.add_argument("--password", help="default: three words and a number")
+    s.add_argument("--days", type=int, default=DEFAULT_DAYS, help=f"read-only after this many days (default {DEFAULT_DAYS})")
+    s.add_argument("--open", action="store_true", help="no password: anyone with the URL can read and answer")
+    s.add_argument("--private", action="store_true", help="each visitor sees only their own answers")
+    s = add("push", cmd_push, "build app.css with Tailwind and sync a directory's files to the app")
+    s.add_argument("slug")
+    s.add_argument("dir")
+    s.add_argument("--no-css", action="store_true", help="skip the Tailwind build")
+    s = add("data", cmd_data, "show the current answers (who, what, when)")
+    s.add_argument("slug")
+    s.add_argument("--history", action="store_true", help="also list every change")
+    s.add_argument("--json", action="store_true", help="full export as JSON")
+    add("ls", cmd_ls, "list apps")
+    s = add("info", cmd_info, "show an app's URL, password (if created here) and status")
+    s.add_argument("slug")
+    s = add("link", cmd_link, "mint a one-time sign-in link (for previewing without the password)")
+    s.add_argument("slug")
+    s.add_argument("--as", dest="as_", metavar="NAME", help="pre-fill the visitor's name")
+    s.add_argument("--minutes", type=int, default=30)
+    s.add_argument("--visitor", metavar="ID", help="private apps: open that visitor's answers (id or its start, from `dwa data`)")
+    s = add("set", cmd_set, "write an answer as admin (seeding, or replying as Tom); works when closed")
+    s.add_argument("slug")
+    s.add_argument("key")
+    s.add_argument("value", help="JSON, or a plain string")
+    s.add_argument("--as", dest="as_", default="Tom", metavar="NAME")
+    s.add_argument("--visitor", metavar="ID", help="private apps: write to that visitor's answers")
+    s = add("merge", cmd_merge, "private apps: one person on two browsers becomes one visitor (answers, visits, history)")
+    s.add_argument("slug")
+    s.add_argument("from_", metavar="FROM", help="visitor id (or its start) to fold in")
+    s.add_argument("into", metavar="INTO", help="visitor id (or its start) to keep")
+    s = add("private", cmd_private, "give each visitor their own answers, seen only by them (and you)")
+    s.add_argument("slug")
+    s.add_argument("--off", action="store_true", help="back to shared answers")
+    s = add("open", cmd_open, "drop the password: anyone with the URL can read and answer")
+    s.add_argument("slug")
+    s = add("password", cmd_password, "set a new password (signs everyone out; ends open access)")
+    s.add_argument("slug")
+    s.add_argument("--password")
+    s = add("close", cmd_close, "make an app read-only")
+    s.add_argument("slug")
+    s = add("reopen", cmd_reopen, "make a closed app writable again")
+    s.add_argument("slug")
+    s.add_argument("--days", type=int, default=DEFAULT_DAYS)
+    s = add("export", cmd_export, f"save answers + history to {EXPORTS.relative_to(REPO)}/")
+    s.add_argument("slug")
+    s = add("reset", cmd_reset, "clear all answers and history (exports first)")
+    s.add_argument("slug")
+    s.add_argument("--yes", action="store_true")
+    s = add("rm", cmd_rm, "delete an app and its files for good (exports answers first)")
+    s.add_argument("slug")
+    s.add_argument("--yes", action="store_true")
+    s = add("img", cmd_img, "convert an image to a web-sized .webp")
+    s.add_argument("src")
+    s.add_argument("--out")
+    s.add_argument("--width", type=int, default=1600, help="max width in px (default 1600)")
+    s.add_argument("--quality", type=int, default=82)
+    add("deploy", cmd_deploy, "deploy the Worker (wrangler) with the token from ~/.config/dwa/.env")
+    add("dev", cmd_dev, "run the Worker locally on 127.0.0.1:8799 (use with --local)")
+
+    a = p.parse_args()
+    needs_client = a.fn not in (cmd_img, cmd_deploy, cmd_dev)
+    a.fn(Client(a.local) if needs_client else None, a)
+
+
+if __name__ == "__main__":
+    main()

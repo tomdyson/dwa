@@ -1,0 +1,5 @@
+[
+  { "id": "t1", "date": "3 Sep 2026", "description": "Example supplier payment", "amount": -1250.00, "suggestion": "Cost of sales" },
+  { "id": "t2", "date": "5 Sep 2026", "description": "Example client receipt", "amount": 4800.00, "suggestion": "Invoice 1042" },
+  { "id": "t3", "date": "9 Sep 2026", "description": "Example card transaction", "amount": -42.99, "suggestion": "Software subscriptions" }
+]

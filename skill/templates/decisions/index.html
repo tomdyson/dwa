@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Decisions to make</title>
+<link rel="stylesheet" href="app.css">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@400;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- dwa.js first (plain script), then Alpine (deferred): the store registers on alpine:init. -->
+<script src="_dwa.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"></script>
+<style>
+  :root { --copper-light: #FAF5EE; --terracotta: #E76F51; --emerald: #2A9D8F; --ink: #2B2B2B; }
+  body { font-family: 'Inter', system-ui, sans-serif; color: var(--ink); background-color: var(--copper-light);
+         background-image: repeating-linear-gradient(135deg, rgba(231,111,81,0.045) 0 2px, transparent 2px 18px); }
+  .serif { font-family: 'Gowun Batang', serif; letter-spacing: -0.01em; }
+  .card { background: white; border-radius: 18px; box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 8px 24px -8px rgba(0,0,0,.08); }
+  [x-cloak] { display: none !important; }
+</style>
+</head>
+<body x-data="page" class="min-h-screen">
+<main class="mx-auto max-w-3xl px-4 py-8 sm:px-6 sm:py-12">
+
+  <header class="mb-8">
+    <p class="text-sm text-stone-500">Client name · Month 2026</p>
+    <h1 class="serif mt-1 text-3xl sm:text-4xl">Decisions to make</h1>
+    <p class="mt-3 max-w-2xl text-stone-600">One or two plain sentences on what this page is for and what we need from the reader.</p>
+    <div class="mt-4 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-stone-600" x-cloak x-show="$store.dwa.ready">
+      <span><strong x-text="$store.dwa.count(questions.map(q => q.id + '.choice'))"></strong> of <span x-text="questions.length"></span> answered</span>
+      <span x-show="$store.dwa.me">You're answering as <strong x-text="$store.dwa.me"></strong>
+        <button type="button" class="underline decoration-stone-300 underline-offset-2 hover:decoration-stone-600" @click="$store.dwa.rename()">change</button></span>
+    </div>
+  </header>
+
+  <p x-cloak x-show="$store.dwa.error" x-text="$store.dwa.error" role="alert"
+     class="sticky top-2 z-10 mb-4 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800 outline outline-1 outline-red-200"></p>
+
+  <template x-for="q in questions" :key="q.id">
+    <section class="card mb-6 p-5 sm:p-7" :id="q.id">
+      <p class="text-xs font-semibold uppercase tracking-wide text-stone-400" x-text="q.id"></p>
+      <h2 class="serif mt-1 text-xl sm:text-2xl" x-text="q.title"></h2>
+      <!-- body is written by us, never by visitors: x-html is safe here and only here. -->
+      <div class="mt-3 space-y-3 text-[0.95rem] leading-relaxed text-stone-700" x-html="q.body"></div>
+
+      <fieldset class="mt-5 grid gap-2" :disabled="$store.dwa.closed">
+        <legend class="sr-only" x-text="q.title"></legend>
+        <template x-for="opt in q.options" :key="opt.key">
+          <label class="flex cursor-pointer gap-3 rounded-xl p-3.5 outline outline-1 outline-stone-200 transition hover:bg-stone-50
+                        has-[:checked]:bg-orange-50 has-[:checked]:outline-2 has-[:checked]:outline-[var(--terracotta)]">
+            <input type="radio" class="mt-1 shrink-0 accent-[var(--terracotta)]" :name="q.id" :value="opt.key"
+                   :checked="$store.dwa.val(q.id + '.choice') === opt.key" @change="$store.dwa.save(q.id + '.choice', opt.key)">
+            <span class="text-sm leading-relaxed"><strong x-text="opt.label"></strong>
+              <span class="text-stone-600" x-show="opt.detail" x-text="opt.detail"></span></span>
+          </label>
+        </template>
+      </fieldset>
+      <p class="mt-2 text-xs text-stone-500" x-show="$store.dwa.has(q.id + '.choice')"
+         x-text="'Chosen by ' + $store.dwa.by(q.id + '.choice') + ', ' + $store.dwa.ago(q.id + '.choice')"></p>
+
+      <label class="mt-5 block text-sm font-medium" :for="q.id + '-note'">Anything to add?</label>
+      <textarea :id="q.id + '-note'" rows="3" x-data="dwaText(q.id + '.note')" x-model="draft" x-bind="field"
+                class="mt-1.5 w-full rounded-xl p-3 text-sm outline outline-1 outline-stone-300 focus:outline-2 focus:outline-[var(--terracotta)] disabled:bg-stone-50"></textarea>
+      <p class="mt-1 h-4 text-xs text-stone-500"
+         x-text="$store.dwa.saving[q.id + '.note'] ? 'Saving…' : ($store.dwa.has(q.id + '.note') ? 'Last edited by ' + $store.dwa.by(q.id + '.note') + ', ' + $store.dwa.ago(q.id + '.note') : '')"></p>
+    </section>
+  </template>
+
+  <footer class="mt-10 text-center text-xs text-stone-400">Answers save as you go and everyone with the link sees them.</footer>
+</main>
+
+<script>
+document.addEventListener("alpine:init", () => {
+  Alpine.data("page", () => ({
+    // Keys are built from `id` (A1.choice, A1.note): never change an id once the page is shared.
+    questions: [
+      {
+        id: "A1",
+        title: "A question written as the reader would ask it",
+        body: `<p>What the situation is, in plain terms. Then why it matters.</p>
+               <figure class="rounded-xl bg-stone-50 p-4">
+                 <svg viewBox="0 0 420 90" class="w-full" role="img" aria-label="Today: three manual steps. Proposed: one.">
+                   <g font-family="Inter, sans-serif" font-size="12" fill="#2B2B2B">
+                     <text x="0" y="16" font-weight="600">Today</text>
+                     <rect x="60" y="2" width="90" height="24" rx="6" fill="#fff" stroke="#d6d3d1"/><text x="72" y="18">Export</text>
+                     <rect x="170" y="2" width="90" height="24" rx="6" fill="#fff" stroke="#d6d3d1"/><text x="182" y="18">Re-key</text>
+                     <rect x="280" y="2" width="90" height="24" rx="6" fill="#fff" stroke="#d6d3d1"/><text x="292" y="18">Check</text>
+                     <text x="0" y="70" font-weight="600">Proposed</text>
+                     <rect x="60" y="56" width="310" height="24" rx="6" fill="#FDEEE9" stroke="#E76F51"/><text x="72" y="72">Import once, checked automatically</text>
+                   </g>
+                 </svg>
+                 <figcaption class="mt-2 text-xs text-stone-500">Diagrams are inline SVG: crisp at any size, no files to manage.</figcaption>
+               </figure>`,
+        options: [
+          { key: "a", label: "(a) First option.", detail: "What it means in practice, and what it costs." },
+          { key: "b", label: "(b) Second option.", detail: "The trade-off, stated neutrally." },
+          { key: "discuss", label: "Not sure yet — let's discuss." },
+        ],
+      },
+    ],
+  }));
+});
+</script>
+</body>
+</html>

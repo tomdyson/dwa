@@ -1,0 +1,32 @@
+name = "dwa"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+account_id = "c9c4095a2d3bd6aaa7a3bf0b9664130d"
+workers_dev = false
+routes = [{ pattern = "with.tomd.org", custom_domain = true }]
+
+# The browser library is served as text, not bundled as a module.
+[[rules]]
+type = "Text"
+globs = ["**/*.client.js"]
+fallthrough = true
+
+[[durable_objects.bindings]]
+name = "APP"
+class_name = "AppStore"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "dwa-files"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AppStore"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Registry"]
