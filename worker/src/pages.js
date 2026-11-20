@@ -45,6 +45,18 @@ export function loginPage(slug, title, error) {
 export const lockedPage = (title) =>
   shell(title, `<h1>${esc(title)}</h1><p class="err">Too many wrong passwords. Please wait 15 minutes and try again.</p>`, 429);
 
+// What opening a one-time link shows. The link is used only when the button is pressed, so a
+// message app or mail scanner that fetches the URL to build a preview can't use it up.
+export const enterPage = (slug, title, token) =>
+  shell(
+    title,
+    `<h1>${esc(title)}</h1>
+<p>This link opens the page for you, with no password. It works once.</p>
+<form method="post" action="/${esc(slug)}/_enter">
+<input type="hidden" name="t" value="${esc(token)}">
+<button autofocus>Continue</button></form>`,
+  );
+
 export const linkExpiredPage = () =>
   shell("Link expired", `<h1>This link has expired</h1><p>Links like this work once and for a short time. Ask for a new one, or use the password.</p>`, 410);
 

@@ -232,6 +232,11 @@ export class AppStore extends DurableObject {
     this.sql.exec("INSERT INTO login_failures VALUES (?, ?)", ip, Date.now());
   }
 
+  // Has this entry link been used? Asked when the link is opened, which doesn't use it.
+  nonceUsed(nonce) {
+    return this.sql.exec("SELECT 1 FROM used_nonces WHERE nonce = ?", nonce).toArray().length > 0;
+  }
+
   // One-time entry links: true the first time a nonce is seen, false after.
   useNonce(nonce, exp) {
     this.sql.exec("DELETE FROM used_nonces WHERE exp < ?", Date.now());

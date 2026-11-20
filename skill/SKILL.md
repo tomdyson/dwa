@@ -24,7 +24,7 @@ A page Tom shares with a client by URL + password (or by URL alone, for an open 
 4. **Create the app:** `dwa new <slug> --title "Finance decisions"`. It prints a password like `otter-maple-lantern-42` and records it on this machine (`dwa info <slug>` shows it again). `--days N` changes the 60-day close. `--open` makes it need no password, `--private` gives each visitor their own answers (both below).
 5. **Publish:** `dwa push <slug> ~/Documents/code/dwa/apps/<slug>`. It builds `app.css` with the Tailwind CLI and syncs the folder (uploads changed files, removes deleted ones). Push again after every edit.
 6. **Check it yourself before Tom sees it:**
-   - `dwa link <slug> --as "Tom (preview)"` prints a one-time sign-in link (30 min, single use). Navigate the Browser pane to it, so no password is typed.
+   - `dwa link <slug> --as "Tom (preview)"` prints a one-time sign-in link (30 min, single use). Navigate the Browser pane to it and press **Continue**, so no password is typed. Opening the link doesn't use it; pressing Continue does, so a link preview in WhatsApp or iMessage can't use it up.
    - Screenshot at desktop width and at 375 px (`resize_window`). Clients open these on phones.
    - Answer something, confirm it with `dwa data <slug>`, then clear test answers with `dwa reset <slug> --yes` before anyone else sees the page.
 7. **Hand over:** give Tom the URL and password (just the URL for an open app) as a short message he can paste. Never send it to a client yourself.

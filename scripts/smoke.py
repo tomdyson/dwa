@@ -123,6 +123,12 @@ def cookie_from(resp, name="dwa"):
     return ""
 
 
+def press_continue(site, path):
+    """Use a one-time link as a person does: the Continue button on the page it opens posts its token."""
+    u = urllib.parse.urlsplit(path)
+    return site.req("POST", u.path, form={"t": urllib.parse.parse_qs(u.query)["t"][0]})
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--local", action="store_true")
@@ -218,12 +224,16 @@ def main():
         st, _, body = site.req("POST", f"/_admin/apps/{s1}/links", {"name": "Linked"}, admin=True)
         link = urllib.parse.urlsplit(json.loads(body)["url"])
         path = f"{link.path}?{link.query}"
-        st, r, _ = site.req("GET", path)
-        check("link signs in (303 + cookie)", st == 303 and cookie_from(r), st)
+        st, r, page = site.req("GET", path)
+        check("opening a link shows Continue and signs nobody in", st == 200 and b"Continue" in page and not cookie_from(r), st)
+        check("opening it again (a link preview) doesn't use it up", site.req("GET", path)[0] == 200)
+        st, r, _ = press_continue(site, path)
+        check("Continue signs in (303 + cookie)", st == 303 and cookie_from(r), st)
         check("link sets the visitor's name", "dwa_name=Linked" in cookie_from(r, "dwa_name"))
-        check("link is single-use (second use -> 410)", site.req("GET", path)[0] == 410)
+        check("link is single-use (second Continue -> 410)", press_continue(site, path)[0] == 410)
+        check("a used link opens as expired (410)", site.req("GET", path)[0] == 410)
         tampered = path[:-3] + ("AAA" if not path.endswith("AAA") else "BBB")
-        check("tampered link -> 410", site.req("GET", tampered)[0] == 410)
+        check("tampered link -> 410", site.req("GET", tampered)[0] == 410 and press_continue(site, tampered)[0] == 410)
         st, _, body = site.req("POST", f"/_admin/apps/{s1}/links", {}, admin=True)
         stale = urllib.parse.urlsplit(json.loads(body)["url"])
 
@@ -300,7 +310,7 @@ def main():
               and state(jar_a).get("P3.x") == "hi A" and "P3.x" not in state(jar_b))
         st, _, body = site.req("POST", f"/_admin/apps/{s1}/links", {"visitor": ids.get("A")}, admin=True)
         u = urllib.parse.urlsplit(json.loads(body)["url"])
-        st, r, _ = site.req("GET", f"{u.path}?{u.query}")
+        st, r, _ = press_continue(site, f"{u.path}?{u.query}")
         vlink = cookie_from(r, "dwa_v").split(";")[0]
         jar_c = {"Cookie": f"{cookie_from(r).split(';')[0]}; {vlink}"}
         check("visitor link opens that visitor's answers on another browser", st == 303 and state(jar_c).get("P1.x") == "from A")

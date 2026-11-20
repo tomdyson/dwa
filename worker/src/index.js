@@ -7,7 +7,7 @@
 //   anyone else's. Tom reads them all through the admin API.
 //   Admin (the dwa CLI): Authorization: Bearer $ADMIN_TOKEN on /_admin/*.
 import { checkPassword, fingerprint, hashPassword, makeToken, readToken, safeEqual } from "./auth.js";
-import { linkExpiredPage, lockedPage, loginPage, notFoundPage, SEC_HEADERS } from "./pages.js";
+import { enterPage, linkExpiredPage, lockedPage, loginPage, notFoundPage, SEC_HEADERS } from "./pages.js";
 import { LIMITS } from "./store.js";
 import CLIENT_JS from "./dwa.client.js";
 
@@ -108,9 +108,15 @@ export default {
     }
 
     // One-time entry link minted by `dwa link`: signs the visitor in without the password.
+    // Opening it (GET) only shows a Continue button; pressing that (POST) is what uses the link.
+    // Message apps and mail scanners fetch URLs to build previews, and must not use it up.
     if (sub === "_enter") {
-      const p = await readToken(env.SESSION_SECRET, url.searchParams.get("t"), "enter");
-      if (!p || p.s !== slug || p.f !== fingerprint(gate.pw_hash) || !(await app.useNonce(p.n, p.e))) return linkExpiredPage();
+      const posted = req.method === "POST";
+      const t = posted ? String((await req.formData().catch(() => null))?.get("t") || "") : url.searchParams.get("t");
+      const p = await readToken(env.SESSION_SECRET, t, "enter");
+      if (!p || p.s !== slug || p.f !== fingerprint(gate.pw_hash)) return linkExpiredPage();
+      if (!posted) return (await app.nonceUsed(p.n)) ? linkExpiredPage() : enterPage(slug, gate.title, t);
+      if (!(await app.useNonce(p.n, p.e))) return linkExpiredPage();
       const headers = new Headers({ Location: `/${slug}/` });
       headers.append("Set-Cookie", await sessionCookie(env, slug, gate.pw_hash));
       if (p.a) headers.append("Set-Cookie", `dwa_name=${encodeURIComponent(p.a)}; Path=/${slug}/; Secure; SameSite=Lax; Max-Age=600`);

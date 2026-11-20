@@ -19,7 +19,7 @@ Files are in R2 rather than the Durable Object because Durable Object SQLite cap
 **Request flow** for `/<slug>/…`:
 1. Look up the app's Durable Object; unknown → 404.
 2. `_login` (POST): password check with PBKDF2 and a per-IP lockout, then a signed session cookie scoped to `Path=/<slug>/`.
-3. `_enter?t=…`: one-time link from `dwa link`.
+3. `_enter?t=…`: one-time link from `dwa link`. GET shows a Continue button; the button's POST signs the visitor in.
 4. Everything else needs the session:
    - `_dwa.js`: the browser library, `worker/src/dwa.client.js`.
    - `_api/info`, `_api/state` (GET), `_api/state/<key>` (PUT).
@@ -33,7 +33,7 @@ Files are in R2 rather than the Durable Object because Durable Object SQLite cap
 - **Private apps:** with `private` set, the Worker gives each browser a signed `dwa_v` cookie (HttpOnly, path-scoped, about 400 days) holding a random visitor id, and reads and writes only that visitor's rows in `pstate`. Live updates go only to sockets tagged with the same id; the Worker sets the tag from the cookie and drops any `X-DWA-Visitor` header the browser sends. Visitor-facing `_api/info` leaves out answer and visitor counts. Caps: 500 keys per visitor, 20,000 private rows per app. `dwa link --visitor` mints an entry link that also sets that visitor's cookie. Visits: when a private app's page loads a visitor's answers (`GET _api/state`), the app records it in `visits` (first and last time, number of visits with a 30-minute gap, the name the browser sends, a rough device label from the User-Agent). Link previews don't run the page's script, so they never count. `dwa reset` clears visits too. `dwa merge` (admin `POST /_admin/apps/<slug>/visitors/merge {from, into}`) folds one visitor into another: `pstate` rows (newer wins), history and visits move to `into`, and `from` goes into an `aliases` table so the browser still holding `from`'s cookie reads and writes the merged answers; its open sockets get a reset and are closed so they reconnect under the merged id.
 - **Open apps:** an app with `open` set (`dwa new --open`, `dwa open`) skips sign-in entirely: anyone with the URL can read the page and the answers, and write answers, within the limits below. It still has a password hash, which `dwa password` reinstates (and clears `open`).
 - **Session cookie:** HMAC-signed, HttpOnly, Secure, SameSite=Lax, scoped to the app's path. It carries a fingerprint of the password hash, so a password change signs everyone out and kills outstanding links.
-- **Entry links:** single use (nonce recorded in the app's object), expire after `--minutes`.
+- **Entry links:** single use (nonce recorded in the app's object), expire after `--minutes`. Opening one doesn't use it: only the Continue button's POST does, so a link preview (WhatsApp, iMessage, a mail scanner) fetching the URL leaves it valid.
 - **Login throttling:** 10 failures per IP per 15 minutes, or 200 per app per hour, then 429 for a while, plus a 750 ms delay on each failure.
 - **Every response:** `X-Robots-Tag: noindex`, `X-Frame-Options: DENY`, `nosniff`.
 - **Limits on visitor writes:** keys `[A-Za-z0-9_.:/-]{1,200}`, values up to 64 KB, at most 5,000 keys per app.
